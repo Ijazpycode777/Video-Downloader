@@ -6,6 +6,7 @@ readme = "README.md"
 authors = [
     { name = "Ijaz", email = "ijazi3485@gmail.com" }
 ]
+
 requires-python = ">=3.14"
 dependencies = [
     "alembic>=1.20.1",
@@ -23,6 +24,7 @@ dependencies = [
     "uvicorn[standard]>=0.54.0",
     "yt-dlp[default]>=2026.10.26",
 ]
+
 
 [project.scripts]
 clipfetch = "clipfetch:main"
