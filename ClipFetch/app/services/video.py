@@ -2,14 +2,21 @@ import asyncio
 import ipaddress
 import os
 import re
-import tempfile
+import shutil
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict, cast
 from urllib.parse import urlsplit
 import logging
 import imageio_ffmpeg
 import yt_dlp
+
+from app.services.storage import (
+    MEDIA_DIR,
+    WORKING_DIRECTORY_PREFIX,
+    acquire_storage_lease,
+)
 
 logger = logging.getLogger(__name__)
 MediaType = Literal["video", "mp3"]
@@ -30,10 +37,18 @@ VIDEO_EXTENSIONS = {
     ".3gp",
 }
 
-# Can be overridden in deployment, e.g. with a Docker volume path.
-DOWNLOAD_DIR = Path(
-    os.getenv("CLIPFETCH_DOWNLOAD_DIR", "downloads")
-).resolve()
+
+class YtDlpOptions(TypedDict, total=False):
+    format: str
+    merge_output_format: str
+    outtmpl: str
+    ffmpeg_location: str
+    noplaylist: bool
+    restrictfilenames: bool
+    quiet: bool
+    no_warnings: bool
+    postprocessors: list[dict[str, str]]
+
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -143,40 +158,29 @@ def _safe_title(title: str) -> str:
     return title or "download"
 
 
-def _unique_destination(title: str, extension: str) -> Path:
-    """Find an unused destination without overwriting existing files."""
-
-    candidate = DOWNLOAD_DIR / f"{title}{extension}"
-    counter = 1
-
-    while candidate.exists():
-        candidate = DOWNLOAD_DIR / f"{title} ({counter}){extension}"
-        counter += 1
-
-    return candidate
-
-
-def _publish_file(source: Path, title: str) -> Path:
-    """Publish a completed file without overwriting another download."""
-
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-    counter = 0
-
+def _publish_file(source: Path) -> Path:
+    """Publish a completed file under an unguessable, app-owned name."""
     while True:
-        suffix = f" ({counter})" if counter else ""
-        destination = DOWNLOAD_DIR / (
-            f"{title}{suffix}{source.suffix.lower()}"
+        destination = MEDIA_DIR / (
+            f"{uuid.uuid4().hex}{source.suffix.lower()}"
         )
 
         try:
-            # Atomic creation fails if another download already owns
-            # this filename. The temp directory is on the same volume.
             os.link(source, destination)
-            source.unlink()
-            return destination
         except FileExistsError:
-            counter += 1
+            continue
+
+        try:
+            source.unlink()
+            # Retention starts when processing completes, not at first fragment.
+            os.utime(destination, None)
+            return destination
+        except OSError:
+            try:
+                destination.unlink()
+            except OSError:
+                logger.exception("Could not remove an unpublished media file.")
+            raise
 
 
 def _download_media(
@@ -187,61 +191,65 @@ def _download_media(
     """Perform the blocking yt-dlp download and finalize its file."""
 
     validate_download_request(url, media_type, quality)
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    lease = acquire_storage_lease(shared=True)
+    if lease is None:
+        raise VideoDownloadError("Media storage is temporarily unavailable.")
 
-    # A unique temporary directory keeps partial downloads separate
-    # from completed, permanently stored files.
-    with tempfile.TemporaryDirectory(
-        prefix=".clipfetch-",
-        dir=DOWNLOAD_DIR,
-    ) as temporary_directory:
-        temp_dir = Path(temporary_directory)
-
-        if media_type == "video":
-            if quality == "best":
-                format_selector = "bestvideo*+bestaudio/best"
-            else:
-                format_selector = (
-                    f"bestvideo[height<={quality}]+bestaudio/"
-                    f"best[height<={quality}]"
-                )
-
-            options: dict[str, Any] = {
-                "format": format_selector,
-                "merge_output_format": "mp4",
-                "outtmpl": str(temp_dir / "%(id)s.%(ext)s"),
-                "ffmpeg_location": FFMPEG_EXE,
-                "noplaylist": True,
-                "restrictfilenames": True,
-                "quiet": True,
-                "no_warnings": True,
-            }
-
-        else:
-            audio_quality = "0" if quality == "best" else quality
-
-            options = {
-                "format": "bestaudio/best",
-                "outtmpl": str(temp_dir / "%(id)s.%(ext)s"),
-                "ffmpeg_location": FFMPEG_EXE,
-                "noplaylist": True,
-                "restrictfilenames": True,
-                "quiet": True,
-                "no_warnings": True,
-                "postprocessors": [
-                    {
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": audio_quality,
-                    }
-                ],
-            }
+    with lease:
+        MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        temp_dir = (
+            MEDIA_DIR
+            / f"{WORKING_DIRECTORY_PREFIX}{uuid.uuid4().hex}"
+        )
+        temp_dir.mkdir()
 
         try:
-            with yt_dlp.YoutubeDL(options)as ydl:
+            if media_type == "video":
+                if quality == "best":
+                    format_selector = "bestvideo*+bestaudio/best"
+                else:
+                    format_selector = (
+                        f"bestvideo[height<={quality}]+bestaudio/"
+                        f"best[height<={quality}]"
+                    )
+
+                options: YtDlpOptions = {
+                    "format": format_selector,
+                    "merge_output_format": "mp4",
+                    "outtmpl": str(temp_dir / "%(id)s.%(ext)s"),
+                    "ffmpeg_location": FFMPEG_EXE,
+                    "noplaylist": True,
+                    "restrictfilenames": True,
+                    "quiet": True,
+                    "no_warnings": True,
+                }
+
+            else:
+                audio_quality = "0" if quality == "best" else quality
+
+                options = {
+                    "format": "bestaudio/best",
+                    "outtmpl": str(temp_dir / "%(id)s.%(ext)s"),
+                    "ffmpeg_location": FFMPEG_EXE,
+                    "noplaylist": True,
+                    "restrictfilenames": True,
+                    "quiet": True,
+                    "no_warnings": True,
+                    "postprocessors": [
+                        {
+                            "key": "FFmpegExtractAudio",
+                            "preferredcodec": "mp3",
+                            "preferredquality": audio_quality,
+                        }
+                    ],
+                }
+
+            # yt-dlp's type stub requires every defaulted option.
+            with yt_dlp.YoutubeDL(cast(Any, options)) as ydl:
                 info = ydl.extract_info(url, download=True)
 
-            if not info or not info.get("title"):
+            source_title = info.get("title") if info else None
+            if not isinstance(source_title, str) or not source_title:
                 raise VideoDownloadError(
                     "The source did not provide a usable media title."
                 )
@@ -271,30 +279,36 @@ def _download_media(
                 key=lambda path: path.stat().st_size,
             )
 
-            if completed_file.stat().st_size == 0:
+            file_size = completed_file.stat().st_size
+            if file_size == 0:
                 raise VideoDownloadError(
                     "The downloaded file is empty."
                 )
-            title = _safe_title(str(info["title"]))
-            final_path = _publish_file(completed_file, title)
+            title = _safe_title(source_title)
+            final_path = _publish_file(completed_file)
 
             return {
                 "message": "Download successful!",
-                "filename": final_path.name,
-                "title": str(info["title"]),
+                "filename": f"{title}{final_path.suffix}",
+                "title": source_title,
                 "media_type": media_type,
                 "quality_requested": quality,
                 "duration": info.get("duration"),
                 "extractor": info.get("extractor"),
-                "file_size": final_path.stat().st_size,
+                "file_size": file_size,
                 "filepath": str(final_path),
             }
 
         except VideoDownloadError:
             raise
         except Exception as exc:
-            logger.exception("Video Download or Processing failed!") 
-            raise VideoDownloadError("The media could not be downloaded or processed. " "Check the URL, available formats and FFmpeg support.") from exc
+            logger.exception("Video download or processing failed.")
+            raise VideoDownloadError(
+                "The media could not be downloaded or processed. "
+                "Check the URL, available formats and FFmpeg support."
+            ) from exc
+        finally:
+            shutil.rmtree(temp_dir)
 
 
 async def download_media(
