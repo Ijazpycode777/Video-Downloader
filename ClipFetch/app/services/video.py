@@ -7,11 +7,11 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
-
+import logging
 import imageio_ffmpeg
 import yt_dlp
 
-
+logger = logging.getLogger(__name__)
 MediaType = Literal["video", "mp3"]
 
 VIDEO_QUALITIES = {"360", "480", "720", "1080", "best"}
@@ -293,11 +293,8 @@ def _download_media(
         except VideoDownloadError:
             raise
         except Exception as exc:
-            # Keep raw internal exceptions out of the public response.
-            raise VideoDownloadError(
-                "The media could not be downloaded or processed. "
-                "Check the URL, available formats, and FFmpeg support."
-            ) from exc
+            logger.exception("Video Download or Processing failed!") 
+            raise VideoDownloadError("The media could not be downloaded or processed. " "Check the URL, available formats and FFmpeg support.") from exc
 
 
 async def download_media(
