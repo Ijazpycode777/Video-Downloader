@@ -21,7 +21,7 @@ dependencies = [
     "sqlalchemy>=2.1.4",
     "uuid>=1.30",
     "uvicorn[standard]>=0.54.0",
-    "yt-dlp[default]>=2026.8.19",
+    "yt-dlp[default]>=2026.10.26",
 ]
 
 [project.scripts]
