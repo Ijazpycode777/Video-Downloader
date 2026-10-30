@@ -1,6 +1,8 @@
 import secrets
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -32,6 +34,27 @@ class RegisterRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
+
+
+async def authenticate_user(
+    email: str,
+    password: str,
+    db: AsyncSession,
+) -> User:
+    result = await db.execute(
+        select(User).where(User.email == email)
+    )
+    user = result.scalar_one_or_none()
+
+    if user is None or not verify_password(
+        password, user.hashed_password
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password",
+        )
+
+    return user
 
 
 @router.post("/register", status_code=status.HTTP_201_CREATED)
@@ -92,25 +115,33 @@ async def login(
     data: LoginRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        select(User).where(User.email == str(data.email))
-    )
-    user = result.scalar_one_or_none()
-
-    if user is None or not verify_password(
-        data.password, user.hashed_password
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password",
-        )
-
+    user = await authenticate_user(str(data.email), data.password, db)
     access_token = create_access_token(user.id)
 
     return {
         "access_token": access_token,
         "token_type": "bearer",
     }
+
+
+@router.post("/token")
+async def issue_token(
+    form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
+    db: AsyncSession = Depends(get_db),
+):
+    """Authenticate with the account email in OAuth2's username field."""
+    user = await authenticate_user(
+        form_data.username,
+        form_data.password,
+        db,
+    )
+
+    return {
+        "access_token": create_access_token(user.id),
+        "token_type": "bearer",
+    }
+
+
 @router.get("/me")
 async def get_profile(current_user: User = Depends(get_current_user)):
     return {

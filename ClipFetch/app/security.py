@@ -26,7 +26,7 @@ password_hasher = PasswordHasher()
 # Extracts "Bearer <token>" from the Authorization header.
 # JWT validation happens separately in get_current_user().
 oauth2_scheme = OAuth2PasswordBearer(
-    tokenUrl="/auth/login",
+    tokenUrl="/auth/token",
 )
 
 
