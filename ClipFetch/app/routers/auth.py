@@ -37,12 +37,15 @@ class LoginRequest(BaseModel):
 
 
 async def authenticate_user(
-    email: str,
+    identifier: str,
     password: str,
     db: AsyncSession,
 ) -> User:
     result = await db.execute(
-        select(User).where(User.email == email)
+        select(User).where(
+            (User.email == identifier)
+            | (User.username == identifier)
+        )
     )
     user = result.scalar_one_or_none()
 
@@ -51,7 +54,7 @@ async def authenticate_user(
     ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password",
+            detail="Invalid username/email or password",
         )
 
     return user
@@ -129,7 +132,7 @@ async def issue_token(
     form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
     db: AsyncSession = Depends(get_db),
 ):
-    """Authenticate with the account email in OAuth2's username field."""
+    """Authenticate with the account username or email."""
     user = await authenticate_user(
         form_data.username,
         form_data.password,

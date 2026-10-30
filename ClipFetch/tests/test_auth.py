@@ -1,7 +1,7 @@
 import os
 import unittest
 import uuid
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 os.environ.setdefault(
     "DATABASE_URL",
@@ -23,6 +23,41 @@ from main import app
 
 
 class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_authentication_accepts_email_or_username(self):
+        user = User(
+            id=uuid.uuid4(),
+            username="test-user",
+            email="test@example.com",
+            hashed_password="test-hash",
+        )
+        result = Mock()
+        result.scalar_one_or_none.return_value = user
+
+        for identifier in (user.email, user.username):
+            with self.subTest(identifier=identifier):
+                db = AsyncMock()
+                db.execute.return_value = result
+
+                with patch.object(
+                    auth,
+                    "verify_password",
+                    return_value=True,
+                ) as verify:
+                    authenticated_user = await auth.authenticate_user(
+                        identifier,
+                        "correct-horse",
+                        db,
+                    )
+
+                self.assertIs(authenticated_user, user)
+                statement = str(db.execute.await_args.args[0])
+                self.assertIn("users.email", statement)
+                self.assertIn("users.username", statement)
+                verify.assert_called_once_with(
+                    "correct-horse",
+                    user.hashed_password,
+                )
+
     async def test_oauth2_form_issues_token_using_email_as_username(self):
         user = User(
             id=uuid.uuid4(),

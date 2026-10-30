@@ -116,6 +116,7 @@ Authentication routes| User registration and login
 "GET /downloads/{job_id}/file"| Retrieve a completed attachment, subject to authorization
 
 Consult the interactive Swagger documentation at "/docs" for the exact request schemas and authentication requirements.
+For Swagger's OAuth2 login, enter either your account email or username in the "username" field, along with your password.
 
 Temporary media and Render deployment
 
