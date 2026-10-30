@@ -94,7 +94,7 @@ Use the actual variable names and formats expected by the application configurat
 
 Ensure PostgreSQL is running and the configured database exists.
 
-uv run alembic upgrade head
+uv run python -m alembic upgrade head
 
 5. Start the API
 
