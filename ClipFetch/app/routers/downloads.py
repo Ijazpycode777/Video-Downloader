@@ -8,12 +8,17 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl, model_validator
 from sqlalchemy import select
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import (
+    DataError,
+    IntegrityError,
+    OperationalError,
+    SQLAlchemyError,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.types import Message, Receive, Scope, Send
 
 from app.engine import get_db
-from app.models import DownloadRecord, User
+from app.models import DownloadRecord, User, UserProviderCookie
 from app.security import get_current_user
 from app.services.storage import (
     StorageLease,
@@ -23,7 +28,21 @@ from app.services.storage import (
     is_expired,
     resolve_download_path,
 )
-from app.services.video import VideoDownloadError, download_media
+from app.services.cookies import (
+    CookieDecryptionError,
+    CookieEncryptionUnavailable,
+    active_auth_cookies,
+    current_cookies,
+    decrypt_cookies,
+    is_expired as are_cookies_expired,
+    serialize_netscape_cookies,
+)
+from app.services.video import (
+    ProviderAuthenticationRejectedError,
+    ProviderAuthenticationRequiredError,
+    VideoDownloadError,
+    download_media,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -218,25 +237,47 @@ async def create_download(
             media_type=data.media_type,
             quality=data.quality,
         )
+    except ProviderAuthenticationRequiredError:
+        result = await _retry_with_user_cookies(
+            data=data,
+            current_user=current_user,
+            db=db,
+        )
     except VideoDownloadError as exc:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=exc.status_code,
             detail=str(exc),
         ) from exc
     except Exception as exc:
         logger.exception("Unexpected error while creating a download.")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="The download could not be completed.",
+            detail=(
+                "The server encountered an unexpected error while "
+                "preparing this download. Please retry the request."
+            ),
         ) from exc
 
-    media_path = Path(str(result["filepath"]))
-    filename = Path(str(result["filename"])).name
+    try:
+        media_path = Path(str(result["filepath"]))
+        filename = Path(str(result["filename"])).name
+    except (KeyError, TypeError, ValueError) as exc:
+        logger.exception("Downloader returned incomplete file metadata.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "The downloader completed without returning the media "
+                "filename and file location required to deliver the file."
+            ),
+        ) from exc
     if not filename or filename in {".", ".."}:
         await asyncio.to_thread(delete_media_file, media_path)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="The downloader returned an invalid filename.",
+            detail=(
+                "The media provider returned an invalid filename, so the "
+                "download could not be delivered."
+            ),
         )
 
     try:
@@ -265,9 +306,35 @@ async def create_download(
             logger.exception("Could not roll back download history.")
         response._storage_lease.release()
         await asyncio.to_thread(delete_media_file, media_path)
+        if isinstance(exc, IntegrityError):
+            error_detail = (
+                "The media was downloaded, but its filename conflicts with "
+                "an existing history record. The file was discarded."
+            )
+            error_status = status.HTTP_409_CONFLICT
+        elif isinstance(exc, DataError):
+            error_detail = (
+                "The media was downloaded, but its filename could not be "
+                "stored because it exceeds a database field limit or has "
+                "an invalid value. The file was discarded."
+            )
+            error_status = status.HTTP_422_UNPROCESSABLE_ENTITY
+        elif isinstance(exc, OperationalError):
+            error_detail = (
+                "The media was downloaded, but its filename could not be "
+                "saved because PostgreSQL is unavailable. The file was "
+                "discarded; please retry."
+            )
+            error_status = status.HTTP_503_SERVICE_UNAVAILABLE
+        else:
+            error_detail = (
+                "The media was downloaded, but PostgreSQL could not save "
+                "its filename to your history. The file was discarded."
+            )
+            error_status = status.HTTP_500_INTERNAL_SERVER_ERROR
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="The download could not be recorded. Please retry.",
+            status_code=error_status,
+            detail=error_detail,
         ) from exc
     except Exception as exc:
         logger.exception("Unexpected error while recording download history.")
@@ -279,10 +346,107 @@ async def create_download(
         await asyncio.to_thread(delete_media_file, media_path)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="The download could not be recorded.",
+            detail=(
+                "The media was downloaded, but its filename could not be "
+                "saved to your history because of an unexpected server "
+                "error. The file was discarded."
+            ),
         ) from exc
 
     return response
+
+
+async def _retry_with_user_cookies(
+    *,
+    data: DownloadRequest,
+    current_user: User,
+    db: AsyncSession,
+) -> dict[str, object]:
+    result = await db.execute(
+        select(UserProviderCookie).where(
+            UserProviderCookie.user_id == current_user.id,
+            UserProviderCookie.provider == "youtube",
+        )
+    )
+    stored = result.scalar_one_or_none()
+    if stored is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=(
+                "YouTube requires an authenticated session for this "
+                "request. Import your own YouTube Netscape cookie file at "
+                "POST /auth/me/cookies/youtube; ClipFetch cannot sign in "
+                "for you."
+            ),
+        )
+
+    try:
+        cookies = decrypt_cookies(stored.encrypted_cookies)
+    except (CookieEncryptionUnavailable, CookieDecryptionError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+
+    if are_cookies_expired(cookies):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=(
+                "Your YouTube authentication cookies have expired. Export "
+                "and import a fresh cookie file before retrying."
+            ),
+        )
+    if stored.requires_reauthentication:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=(
+                "YouTube rejected your saved session. Reauthenticate with "
+                "YouTube and import a replacement cookie file."
+            ),
+        )
+
+    valid_auth_cookies = active_auth_cookies(cookies)
+    if not valid_auth_cookies:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=(
+                "No unexpired YouTube authentication cookies remain. "
+                "Reauthenticate and import a fresh cookie file."
+            ),
+        )
+    cookie_file_data = serialize_netscape_cookies(current_cookies(cookies))
+
+    try:
+        return await download_media(
+            url=str(data.url),
+            media_type=data.media_type,
+            quality=data.quality,
+            cookie_data=cookie_file_data,
+        )
+    except ProviderAuthenticationRejectedError as exc:
+        stored.requires_reauthentication = True
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=(
+                "YouTube rejected your saved session. Reauthenticate with "
+                "YouTube and import a replacement cookie file."
+            ),
+        ) from exc
+    except VideoDownloadError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=str(exc),
+        ) from exc
+    except Exception as exc:
+        logger.exception("Unexpected error while retrying with user cookies.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "An unexpected error occurred while retrying the YouTube "
+                "download. Please retry the request."
+            ),
+        ) from exc
 
 
 @router.get(

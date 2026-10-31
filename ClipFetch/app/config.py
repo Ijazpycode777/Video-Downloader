@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from cryptography.fernet import Fernet, InvalidToken
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
@@ -25,6 +26,7 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     INVITE_CODE: str = Field(default="", repr=False)
+    COOKIE_ENCRYPTION_KEY: str = Field(default="", repr=False)
 
     @field_validator("DATABASE_URL")
     @classmethod
@@ -93,6 +95,23 @@ class Settings(BaseSettings):
             raise ValueError("INVITE_CODE must not be empty.")
 
         return invite_code
+
+    @field_validator("COOKIE_ENCRYPTION_KEY")
+    @classmethod
+    def validate_cookie_encryption_key(cls, value: str) -> str:
+        key = value.strip()
+        if not key:
+            return key
+
+        try:
+            Fernet(key.encode("ascii"))
+        except (ValueError, UnicodeEncodeError, TypeError, InvalidToken) as exc:
+            raise ValueError(
+                "COOKIE_ENCRYPTION_KEY must be a valid Fernet key. "
+                "Generate one with Fernet.generate_key()."
+            ) from exc
+
+        return key
 
 
 settings = Settings()

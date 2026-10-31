@@ -1,4 +1,6 @@
 import os
+import base64
+import json
 import unittest
 import uuid
 from unittest.mock import AsyncMock, Mock, patch
@@ -16,18 +18,56 @@ os.environ.setdefault(
 os.environ.setdefault("JWT_ALGORITHM", "HS256")
 os.environ.setdefault("ACCESS_TOKEN_EXPIRE_MINUTES", "30")
 os.environ.setdefault("INVITE_CODE", "unit-test-only-placeholder-invite")
+os.environ.setdefault(
+    "COOKIE_ENCRYPTION_KEY",
+    base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode(),
+)
 
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import ValidationError
+from sqlalchemy.exc import OperationalError
+from starlette.requests import Request
 
 from app.config import Settings, settings
 from app.models import User
 from app.routers import auth
 from app.security import create_access_token
-from main import app
+from main import app, handle_database_error
 
 
 class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_database_operational_error_returns_specific_safe_message(
+        self,
+    ):
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "scheme": "http",
+                "path": "/downloads/history",
+                "headers": [],
+                "query_string": b"",
+            }
+        )
+        error = OperationalError(
+            "SELECT secret_data",
+            {},
+            RuntimeError("private connection detail"),
+        )
+
+        response = await handle_database_error(request, error)
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            json.loads(bytes(response.body).decode("utf-8"))["detail"],
+            (
+                "The database is temporarily unavailable. Check the "
+                "database connection and retry."
+            ),
+        )
+        self.assertNotIn(b"secret_data", response.body)
+        self.assertNotIn(b"private connection detail", response.body)
+
     def test_authentication_configuration_is_fixed_to_hs256_and_30_minutes(
         self,
     ):

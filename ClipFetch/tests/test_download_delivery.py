@@ -1,4 +1,5 @@
 import os
+import base64
 import tempfile
 import time
 import unittest
@@ -19,6 +20,10 @@ os.environ.setdefault(
     "unit-test-only-placeholder-secret-with-at-least-32-bytes",
 )
 os.environ.setdefault("INVITE_CODE", "unit-test-only-placeholder-invite")
+os.environ.setdefault(
+    "COOKIE_ENCRYPTION_KEY",
+    base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode(),
+)
 
 from fastapi import HTTPException
 
@@ -26,7 +31,8 @@ from app.models import Base, DownloadRecord, User
 from app.routers import downloads
 from app.services import storage
 from app.services import video
-from app.services.video import VideoDownloadError
+from app.services.video import MediaSourceError, VideoDownloadError
+from yt_dlp.utils import DownloadError, PostProcessingError
 
 
 class ScalarResult:
@@ -83,7 +89,7 @@ class DownloadDeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_database_schema_has_filename_history_not_jobs(self):
         self.assertEqual(
             set(Base.metadata.tables),
-            {"users", "download_history"},
+            {"users", "download_history", "user_provider_cookies"},
         )
         self.assertEqual(
             set(Base.metadata.tables["download_history"].columns.keys()),
@@ -203,6 +209,32 @@ class DownloadDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(db.records, [])
         self.assertEqual(db.commits, 0)
 
+    async def test_storage_download_error_returns_its_specific_message(self):
+        db = FakeSession()
+        user = make_user()
+
+        with patch.object(
+            downloads,
+            "download_media",
+            new=AsyncMock(
+                side_effect=video.MediaStorageError(
+                    "Storage directory is not writable."
+                )
+            ),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await downloads.create_download(
+                    make_request("https://example.com/video"),
+                    user,
+                    cast(AsyncSession, db),
+                )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(
+            raised.exception.detail,
+            "Storage directory is not writable.",
+        )
+
     async def test_history_returns_only_names_and_timestamps(self):
         user = make_user()
         timestamp = datetime.now(timezone.utc)
@@ -265,8 +297,61 @@ class DownloadDeliveryTests(unittest.IsolatedAsyncioTestCase):
                         cast(AsyncSession, db),
                     )
 
-        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.status_code, 500)
+        self.assertIn("PostgreSQL could not save", raised.exception.detail)
         self.assertFalse(media_path.exists())
+
+    async def test_yt_dlp_failures_return_safe_category_specific_messages(self):
+        test_cases = (
+            (
+                DownloadError(
+                    "private token from https://example.com/?token=secret"
+                ),
+                video.MediaSourceError,
+                "yt-dlp could not retrieve this source.",
+            ),
+            (
+                PostProcessingError("ffmpeg output"),
+                video.MediaProcessingError,
+                "FFmpeg could not process this media.",
+            ),
+        )
+
+        for error, expected_type, message in test_cases:
+            with self.subTest(error=type(error).__name__):
+                class FailingDownloader:
+                    def __init__(self, options):
+                        self.options = options
+
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *_: object) -> None:
+                        return None
+
+                    def extract_info(self, url: str, *, download: bool):
+                        self.url = url
+                        self.download_requested = download
+                        raise error
+
+                with patch.object(
+                    video.yt_dlp,
+                    "YoutubeDL",
+                    FailingDownloader,
+                ):
+                    with self.assertRaises(expected_type) as raised:
+                        video._download_media(
+                            "https://example.com/video",
+                            "video",
+                            "best",
+                        )
+
+                self.assertIn(message, str(raised.exception))
+                self.assertEqual(
+                    raised.exception.status_code,
+                    expected_type.status_code,
+                )
+                self.assertNotIn("secret", str(raised.exception))
 
     async def test_failed_processing_removes_partial_files(self):
         class FailingDownloader:
@@ -300,6 +385,77 @@ class DownloadDeliveryTests(unittest.IsolatedAsyncioTestCase):
             list(self.media_root.glob(".clipfetch-working-*")),
             [],
         )
+
+    async def test_temporary_cookie_file_is_removed_after_success(self):
+        created_cookie_paths = []
+        cookie_data = b"# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tsecret\n"
+
+        class SuccessfulDownloader:
+            def __init__(self, options):
+                self.options = options
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def extract_info(self, url: str, *, download: bool):
+                cookie_path = Path(self.options["cookiefile"])
+                created_cookie_paths.append(cookie_path)
+                self_cookie_data = cookie_path.read_bytes()
+                if self_cookie_data != cookie_data:
+                    raise AssertionError("Unexpected temporary cookie data.")
+                Path(cookie_path.parent / "result.mp4").write_bytes(b"media")
+                return {"title": "Authenticated video"}
+
+        with patch.object(video.yt_dlp, "YoutubeDL", SuccessfulDownloader):
+            result = video._download_media(
+                "https://youtube.com/watch?v=example",
+                "video",
+                "best",
+                cookie_data,
+            )
+
+        self.assertTrue(Path(result["filepath"]).exists())
+        self.assertEqual(len(created_cookie_paths), 1)
+        self.assertFalse(created_cookie_paths[0].exists())
+        self.assertFalse(created_cookie_paths[0].parent.exists())
+
+    async def test_temporary_cookie_file_is_removed_after_failure(self):
+        created_cookie_paths = []
+        cookie_data = b"# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tsecret\n"
+
+        class FailingDownloader:
+            def __init__(self, options):
+                self.options = options
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def extract_info(self, url: str, *, download: bool):
+                cookie_path = Path(self.options["cookiefile"])
+                created_cookie_paths.append(cookie_path)
+                self_cookie_data = cookie_path.read_bytes()
+                if self_cookie_data != cookie_data:
+                    raise AssertionError("Unexpected temporary cookie data.")
+                raise DownloadError("network unavailable")
+
+        with patch.object(video.yt_dlp, "YoutubeDL", FailingDownloader):
+            with self.assertRaises(MediaSourceError):
+                video._download_media(
+                    "https://youtube.com/watch?v=example",
+                    "video",
+                    "best",
+                    cookie_data,
+                )
+
+        self.assertEqual(len(created_cookie_paths), 1)
+        self.assertFalse(created_cookie_paths[0].exists())
+        self.assertFalse(created_cookie_paths[0].parent.exists())
 
     async def test_media_expires_after_thirty_minutes(self):
         media_path = self.make_media_file()

@@ -6,11 +6,12 @@ import shutil
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Literal, TypedDict, cast
+from typing import Any, Literal, NoReturn, TypedDict, cast
 from urllib.parse import urlsplit
 import logging
 import imageio_ffmpeg
 import yt_dlp
+from yt_dlp.utils import DownloadError, ExtractorError, PostProcessingError
 
 from app.services.storage import (
     MEDIA_DIR,
@@ -48,6 +49,7 @@ class YtDlpOptions(TypedDict, total=False):
     quiet: bool
     no_warnings: bool
     postprocessors: list[dict[str, str]]
+    cookiefile: str
 
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -61,6 +63,108 @@ _download_pool = ThreadPoolExecutor(
 
 class VideoDownloadError(Exception):
     """Raised when a media download cannot be completed."""
+
+    status_code = 400
+
+
+class MediaSourceError(VideoDownloadError):
+    status_code = 422
+
+
+class MediaProcessingError(VideoDownloadError):
+    status_code = 422
+
+
+class MediaStorageError(VideoDownloadError):
+    status_code = 503
+
+
+class InternalMediaError(VideoDownloadError):
+    status_code = 500
+
+
+class ProviderAuthenticationRequiredError(VideoDownloadError):
+    status_code = 401
+
+    def __init__(self) -> None:
+        super().__init__(
+            "The YouTube provider requires an authenticated user session."
+        )
+        self.provider = "youtube"
+
+
+class ProviderAuthenticationRejectedError(
+    ProviderAuthenticationRequiredError
+):
+    pass
+
+
+class RestrictedMediaError(VideoDownloadError):
+    status_code = 403
+
+    def __init__(self) -> None:
+        super().__init__(
+            "The provider reports restricted content. ClipFetch will not use "
+            "cookies to bypass age, paid, regional, private-video, or DRM "
+            "restrictions."
+        )
+
+
+def _youtube_provider_for_url(url: str) -> str | None:
+    try:
+        hostname = urlsplit(url).hostname
+    except ValueError:
+        return None
+    if hostname is None:
+        return None
+    hostname = hostname.lower().rstrip(".")
+    if hostname == "youtube.com" or hostname.endswith(".youtube.com"):
+        return "youtube"
+    return None
+
+
+def _raise_source_error(
+    exc: Exception,
+    *,
+    url: str,
+    has_cookies: bool,
+) -> NoReturn:
+    message = str(exc).casefold().replace("’", "'")
+    provider = _youtube_provider_for_url(url)
+
+    restricted_markers = (
+        "confirm your age",
+        "age-restricted",
+        "members-only",
+        "members only",
+        "private video",
+        "not available in your country",
+        "not available in your region",
+        "drm",
+    )
+    if provider == "youtube" and any(
+        marker in message for marker in restricted_markers
+    ):
+        raise RestrictedMediaError() from exc
+
+    if (
+        provider == "youtube"
+        and "sign in to confirm you're not a bot" in message
+    ):
+        if has_cookies:
+            raise ProviderAuthenticationRejectedError() from exc
+        raise ProviderAuthenticationRequiredError() from exc
+
+    if "429" in message or "too many requests" in message:
+        raise MediaSourceError(
+            "The source provider rate-limited this request. Wait before "
+            "retrying; cookies will not be used to bypass rate limits."
+        ) from exc
+    raise MediaSourceError(
+        "yt-dlp could not retrieve this source. It may be unavailable, "
+        "unsupported, or experiencing a network problem. Verify the URL "
+        "and try again."
+    ) from exc
 
 
 def validate_download_request(
@@ -187,23 +291,42 @@ def _download_media(
     url: str,
     media_type: MediaType,
     quality: str,
+    cookie_data: bytes | None = None,
 ) -> dict[str, Any]:
     """Perform the blocking yt-dlp download and finalize its file."""
 
     validate_download_request(url, media_type, quality)
-    lease = acquire_storage_lease(shared=True)
+    try:
+        lease = acquire_storage_lease(shared=True)
+    except OSError as exc:
+        raise MediaStorageError(
+            "ClipFetch could not access the media storage directory. "
+            "Verify that it exists and is writable."
+        ) from exc
     if lease is None:
-        raise VideoDownloadError("Media storage is temporarily unavailable.")
+        raise MediaStorageError(
+            "Media storage is busy with another operation. Please retry."
+        )
 
     with lease:
-        MEDIA_DIR.mkdir(parents=True, exist_ok=True)
         temp_dir = (
             MEDIA_DIR
             / f"{WORKING_DIRECTORY_PREFIX}{uuid.uuid4().hex}"
         )
-        temp_dir.mkdir()
+        cookie_path: Path | None = None
 
         try:
+            MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+            temp_dir.mkdir()
+            if cookie_data is not None:
+                cookie_path = temp_dir / "youtube-cookies.txt"
+                cookie_descriptor = os.open(
+                    cookie_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+                with os.fdopen(cookie_descriptor, "wb") as cookie_file:
+                    cookie_file.write(cookie_data)
             if media_type == "video":
                 if quality == "best":
                     format_selector = "bestvideo*+bestaudio/best"
@@ -223,7 +346,6 @@ def _download_media(
                     "quiet": True,
                     "no_warnings": True,
                 }
-
             else:
                 audio_quality = "0" if quality == "best" else quality
 
@@ -244,14 +366,38 @@ def _download_media(
                     ],
                 }
 
+            if cookie_path is not None:
+                options["cookiefile"] = str(cookie_path)
+
             # yt-dlp's type stub requires every defaulted option.
-            with yt_dlp.YoutubeDL(cast(Any, options)) as ydl:
-                info = ydl.extract_info(url, download=True)
+            try:
+                with yt_dlp.YoutubeDL(cast(Any, options)) as ydl:
+                    info = ydl.extract_info(url, download=True)
+            except PostProcessingError as exc:
+                logger.warning("FFmpeg media post-processing failed.")
+                raise MediaProcessingError(
+                    "FFmpeg could not process this media. Check that the "
+                    "source has a compatible format and retry."
+                ) from exc
+            except (
+                DownloadError,
+                ExtractorError,
+            ) as exc:
+                logger.warning(
+                    "yt-dlp source retrieval failed (%s).",
+                    type(exc).__name__,
+                )
+                _raise_source_error(
+                    exc,
+                    url=url,
+                    has_cookies=cookie_data is not None,
+                )
 
             source_title = info.get("title") if info else None
             if not isinstance(source_title, str) or not source_title:
-                raise VideoDownloadError(
-                    "The source did not provide a usable media title."
+                raise MediaSourceError(
+                    "The source did not provide a usable media title. "
+                    "Try another video URL."
                 )
 
             if media_type == "mp3":
@@ -267,9 +413,10 @@ def _download_media(
                 ]
 
             if not candidates:
-                raise VideoDownloadError(
+                raise MediaProcessingError(
                     "The download finished without a usable output file. "
-                    "Check FFmpeg compatibility and available formats."
+                    "Check that the requested format is available and "
+                    "FFmpeg can process it."
                 )
 
             # Normally there is one final output file. Prefer the
@@ -281,8 +428,9 @@ def _download_media(
 
             file_size = completed_file.stat().st_size
             if file_size == 0:
-                raise VideoDownloadError(
-                    "The downloaded file is empty."
+                raise MediaProcessingError(
+                    "The source returned an empty media file. Check the "
+                    "source and try again."
                 )
             title = _safe_title(source_title)
             final_path = _publish_file(completed_file)
@@ -301,20 +449,54 @@ def _download_media(
 
         except VideoDownloadError:
             raise
+        except OSError as exc:
+            logger.exception("Media storage operation failed.")
+            raise MediaStorageError(
+                "ClipFetch could not read or write the media file. Verify "
+                "that the configured download directory has free space and "
+                "is writable."
+            ) from exc
         except Exception as exc:
             logger.exception("Video download or processing failed.")
-            raise VideoDownloadError(
-                "The media could not be downloaded or processed. "
-                "Check the URL, available formats and FFmpeg support."
+            raise InternalMediaError(
+                "An unexpected error occurred while preparing this media. "
+                "Retry the request; contact the service administrator if "
+                "the problem continues."
             ) from exc
         finally:
-            shutil.rmtree(temp_dir)
+            cleanup_error: OSError | None = None
+            if cookie_path is not None:
+                try:
+                    cookie_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.exception(
+                        "Could not remove temporary YouTube credentials."
+                    )
+                    cleanup_error = exc
+            try:
+                shutil.rmtree(temp_dir)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.exception(
+                    "Could not remove temporary media directory %s.",
+                    temp_dir,
+                )
+                if cleanup_error is None:
+                    cleanup_error = exc
+            if cleanup_error is not None:
+                raise MediaStorageError(
+                    "ClipFetch could not remove temporary download or "
+                    "credential files. Securely remove the temporary media "
+                    "directory before restarting."
+                ) from cleanup_error
 
 
 async def download_media(
     url: str,
     media_type: MediaType = "video",
     quality: str = "best",
+    cookie_data: bytes | None = None,
 ) -> dict[str, Any]:
     """Download media without blocking the FastAPI event loop."""
 
@@ -327,10 +509,13 @@ async def download_media(
             url,
             media_type,
             quality,
+            cookie_data,
         )
     except VideoDownloadError:
         raise
     except Exception as exc:
-        raise VideoDownloadError(
-            "An unexpected download error occurred."
+        logger.exception("Media download worker failed unexpectedly.")
+        raise InternalMediaError(
+            "The media download worker failed unexpectedly. Please retry "
+            "the request."
         ) from exc
