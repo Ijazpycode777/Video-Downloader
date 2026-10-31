@@ -210,6 +210,8 @@ class DownloadDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 user,
                 cast(AsyncSession, db),
             )
+        history_callback = AsyncMock(wraps=response._on_body_complete)
+        response._on_body_complete = history_callback
 
         async def receive():
             return {"type": "http.request", "body": b"", "more_body": False}
@@ -238,9 +240,15 @@ class DownloadDeliveryTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(OSError):
             await response(scope, receive, disconnecting_send)
 
+        history_callback.assert_not_awaited()
         self.assertEqual(db.records, [])
         self.assertEqual(db.commits, 0)
+        self.assertTrue(response._storage_lease._released)
         self.assertTrue(media_path.exists())
+        old_time = time.time() - storage.RETENTION_SECONDS - 1
+        os.utime(media_path, (old_time, old_time))
+        self.assertEqual(storage.cleanup_expired_files(), 1)
+        self.assertFalse(media_path.exists())
 
     async def test_failed_download_is_not_added_to_history(self):
         db = FakeSession()
