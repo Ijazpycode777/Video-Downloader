@@ -71,6 +71,27 @@ class MediaSourceError(VideoDownloadError):
     status_code = 422
 
 
+class MediaFormatUnavailableError(MediaSourceError):
+    def __init__(self, media_type: MediaType, quality: str) -> None:
+        if media_type == "video" and quality != "best":
+            message = (
+                f"No compatible video format is available at or below "
+                f"{quality}p. Choose a lower resolution or try another "
+                "source."
+            )
+        elif media_type == "mp3":
+            message = (
+                "The source has no compatible audio format for MP3 "
+                "conversion. Try another source."
+            )
+        else:
+            message = (
+                "The source has no compatible video format. Try another "
+                "source."
+            )
+        super().__init__(message)
+
+
 class MediaProcessingError(VideoDownloadError):
     status_code = 422
 
@@ -132,9 +153,14 @@ def _raise_source_error(
     *,
     url: str,
     has_cookies: bool,
+    media_type: MediaType = "video",
+    quality: str = "best",
 ) -> NoReturn:
     message = str(exc).casefold().replace("’", "'")
     provider = _youtube_provider_for_url(url)
+
+    if "requested format is not available" in message:
+        raise MediaFormatUnavailableError(media_type, quality) from exc
 
     restricted_markers = (
         "confirm your age",
@@ -237,6 +263,15 @@ def validate_download_request(
         )
 
 
+def _video_format_selector(quality: str) -> str:
+    if quality == "best":
+        return "bestvideo*+bestaudio/best"
+    return (
+        f"bestvideo[height<={quality}]+bestaudio/"
+        f"best[height<={quality}]"
+    )
+
+
 def _safe_title(title: str) -> str:
     """Create a filesystem-safe filename from the source title."""
 
@@ -332,16 +367,8 @@ def _download_media(
                 with os.fdopen(cookie_descriptor, "wb") as cookie_file:
                     cookie_file.write(cookie_data)
             if media_type == "video":
-                if quality == "best":
-                    format_selector = "bestvideo*+bestaudio/best"
-                else:
-                    format_selector = (
-                        f"bestvideo[height<={quality}]+bestaudio/"
-                        f"best[height<={quality}]"
-                    )
-
                 options: YtDlpOptions = {
-                    "format": format_selector,
+                    "format": _video_format_selector(quality),
                     "merge_output_format": "mp4",
                     "outtmpl": str(temp_dir / "%(id)s.%(ext)s"),
                     "ffmpeg_location": FFMPEG_EXE,
@@ -395,6 +422,8 @@ def _download_media(
                     exc,
                     url=url,
                     has_cookies=cookie_data is not None,
+                    media_type=media_type,
+                    quality=quality,
                 )
 
             source_title = info.get("title") if info else None

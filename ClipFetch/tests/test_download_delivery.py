@@ -210,6 +210,8 @@ class DownloadDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 user,
                 cast(AsyncSession, db),
             )
+        if not isinstance(response, downloads.LeasedFileResponse):
+            self.fail("Download endpoint did not create a leased response.")
         history_callback = AsyncMock(wraps=response._on_body_complete)
         response._on_body_complete = history_callback
 
@@ -562,6 +564,267 @@ class DownloadDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(storage.cleanup_expired_files(), 1)
         self.assertFalse(media_path.exists())
+
+
+class VideoFormatSelectionTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def format(
+        format_id: str,
+        *,
+        height: int | None,
+        video: bool,
+        audio: bool,
+        ext: str = "mp4",
+        tbr: int = 1000,
+    ) -> dict[str, object]:
+        return {
+            "format_id": format_id,
+            "url": f"https://example.invalid/{format_id}",
+            "protocol": "https",
+            "ext": ext,
+            "height": height,
+            "vcodec": "avc1" if video else "none",
+            "acodec": "mp4a" if audio else "none",
+            "tbr": tbr,
+        }
+
+    def select(self, quality: str, formats: list[dict[str, object]]):
+        with video.yt_dlp.YoutubeDL({"quiet": True}) as ydl:
+            selector = ydl.build_format_selector(
+                video._video_format_selector(quality)
+            )
+            context = {
+                "formats": formats,
+                "has_merged_format": any(
+                    item.get("vcodec") != "none"
+                    and item.get("acodec") != "none"
+                    for item in formats
+                ),
+                "incomplete_formats": (
+                    all(item.get("vcodec") == "none" for item in formats)
+                    or all(
+                        item.get("acodec") == "none"
+                        for item in formats
+                    )
+                ),
+            }
+            return list(selector(context))
+
+    def test_exact_requested_resolution_is_selected(self):
+        selected = self.select(
+            "720",
+            [
+                self.format(
+                    "video360",
+                    height=360,
+                    video=True,
+                    audio=False,
+                ),
+                self.format(
+                    "video720",
+                    height=720,
+                    video=True,
+                    audio=False,
+                ),
+                self.format(
+                    "audio",
+                    height=None,
+                    video=False,
+                    audio=True,
+                ),
+                self.format(
+                    "video1080",
+                    height=1080,
+                    video=True,
+                    audio=False,
+                ),
+            ],
+        )
+
+        self.assertEqual(
+            [item["format_id"] for item in selected[0]["requested_formats"]],
+            ["video720", "audio"],
+        )
+
+    def test_unavailable_resolution_uses_best_format_below_limit(self):
+        selected = self.select(
+            "720",
+            [
+                self.format(
+                    "video480",
+                    height=480,
+                    video=True,
+                    audio=False,
+                ),
+                self.format(
+                    "audio",
+                    height=None,
+                    video=False,
+                    audio=True,
+                ),
+                self.format(
+                    "video1080",
+                    height=1080,
+                    video=True,
+                    audio=False,
+                ),
+            ],
+        )
+
+        self.assertEqual(
+            [item["format_id"] for item in selected[0]["requested_formats"]],
+            ["video480", "audio"],
+        )
+
+    def test_best_selector_merges_separate_video_and_audio_streams(self):
+        selected = self.select(
+            "best",
+            [
+                self.format(
+                    "video720",
+                    height=720,
+                    video=True,
+                    audio=False,
+                ),
+                self.format(
+                    "audio",
+                    height=None,
+                    video=False,
+                    audio=True,
+                    ext="m4a",
+                ),
+            ],
+        )
+
+        self.assertEqual(
+            [item["format_id"] for item in selected[0]["requested_formats"]],
+            ["video720", "audio"],
+        )
+
+    def test_combined_stream_fallback_is_selected(self):
+        selected = self.select(
+            "720",
+            [
+                self.format(
+                    "combined720",
+                    height=720,
+                    video=True,
+                    audio=True,
+                ),
+            ],
+        )
+
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["format_id"], "combined720")
+
+    def test_no_format_above_resolution_cap_is_selected(self):
+        selected = self.select(
+            "720",
+            [
+                self.format(
+                    "video1080",
+                    height=1080,
+                    video=True,
+                    audio=False,
+                ),
+                self.format(
+                    "audio",
+                    height=None,
+                    video=False,
+                    audio=True,
+                ),
+            ],
+        )
+
+        self.assertEqual(selected, [])
+
+    def test_no_compatible_format_has_clear_api_error(self):
+        with self.assertRaises(video.MediaFormatUnavailableError) as raised:
+            video._raise_source_error(
+                DownloadError(
+                    "Requested format is not available. "
+                    "Use --list-formats for a list of available formats"
+                ),
+                url="https://youtube.com/watch?v=example",
+                has_cookies=False,
+                media_type="video",
+                quality="720",
+            )
+
+        self.assertEqual(raised.exception.status_code, 422)
+        self.assertIn("at or below 720p", str(raised.exception))
+
+    async def test_no_compatible_format_returns_clear_http_error(self):
+        error = video.MediaFormatUnavailableError("video", "720")
+        with patch.object(
+            downloads,
+            "download_media",
+            new=AsyncMock(side_effect=error),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await downloads.create_download(
+                    make_request("https://example.com/video"),
+                    make_user(),
+                    cast(AsyncSession, FakeSession()),
+                )
+
+        self.assertEqual(raised.exception.status_code, 422)
+        self.assertIn("at or below 720p", raised.exception.detail)
+
+    def test_video_download_configures_mp4_merge_and_ffmpeg(self):
+        captured_options = {}
+
+        class SuccessfulDownloader:
+            def __init__(self, options):
+                captured_options.update(options)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def extract_info(self, url: str, *, download: bool):
+                output_template = str(captured_options["outtmpl"])
+                output_path = Path(
+                    output_template.replace("%(id)s.%(ext)s", "video.mp4")
+                )
+                output_path.write_bytes(b"mp4")
+                return {"title": "Merged video"}
+
+        class NoopLease:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with (
+                patch.object(video, "MEDIA_DIR", Path(temporary_directory)),
+                patch.object(
+                    video,
+                    "acquire_storage_lease",
+                    return_value=NoopLease(),
+                ),
+                patch.object(video.yt_dlp, "YoutubeDL", SuccessfulDownloader),
+            ):
+                result = video._download_media(
+                    "https://example.com/video",
+                    "video",
+                    "720",
+                )
+
+            self.assertEqual(captured_options["merge_output_format"], "mp4")
+            self.assertEqual(
+                captured_options["ffmpeg_location"],
+                video.FFMPEG_EXE,
+            )
+            self.assertEqual(
+                captured_options["format"],
+                video._video_format_selector("720"),
+            )
+            self.assertEqual(Path(result["filepath"]).suffix, ".mp4")
 
 
 if __name__ == "__main__":
