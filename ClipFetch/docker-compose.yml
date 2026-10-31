@@ -1,0 +1,38 @@
+services:
+  database:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-clipfetch}
+      POSTGRES_USER: ${POSTGRES_USER:-clipfetch}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - clipfetch_database:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-clipfetch}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@database:5432/${POSTGRES_DB:-clipfetch}
+      CLIPFETCH_DOWNLOAD_DIR: /var/lib/clipfetch/downloads
+      PORT: 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - clipfetch_media:/var/lib/clipfetch/downloads
+    depends_on:
+      database:
+        condition: service_healthy
+
+volumes:
+  clipfetch_database:
+  clipfetch_media:

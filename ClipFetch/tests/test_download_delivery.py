@@ -3,6 +3,7 @@ import tempfile
 import time
 import unittest
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, patch
@@ -11,51 +12,58 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 os.environ.setdefault(
     "DATABASE_URL",
-    "postgresql+asyncpg://test:test@localhost/clipfetch_test",
+    "postgresql+asyncpg://clipfetch:clipfetch@localhost/clipfetch_test",
 )
-os.environ.setdefault("JWT_SECRET_KEY", "unit-test-only-placeholder")
-os.environ.setdefault("JWT_ALGORITHM", "HS256")
-os.environ.setdefault("ACCESS_TOKEN_EXPIRE_MINUTES", "30")
-os.environ.setdefault("INVITE_CODE", "unit-test-only-placeholder")
+os.environ.setdefault(
+    "JWT_SECRET_KEY",
+    "unit-test-only-placeholder-secret-with-at-least-32-bytes",
+)
+os.environ.setdefault("INVITE_CODE", "unit-test-only-placeholder-invite")
 
 from fastapi import HTTPException
 
-from app.models import DownloadJob, User
+from app.models import Base, DownloadRecord, User
 from app.routers import downloads
 from app.services import storage
 from app.services import video
 from app.services.video import VideoDownloadError
 
 
-class FakeSession:
-    def __init__(self) -> None:
-        self.jobs: dict[uuid.UUID, DownloadJob] = {}
-        self.commits = 0
-        self.get_calls: list[tuple[type[DownloadJob], bool]] = []
+class ScalarResult:
+    def __init__(self, values):
+        self._values = values
 
-    def add(self, job: DownloadJob) -> None:
-        if job.id is None:
-            job.id = uuid.uuid4()
-        self.jobs[job.id] = job
+    def all(self):
+        return self._values
+
+
+class QueryResult:
+    def __init__(self, values):
+        self._values = values
+
+    def scalars(self):
+        return ScalarResult(self._values)
+
+
+class FakeSession:
+    def __init__(self, history_items=None) -> None:
+        self.records: list[DownloadRecord] = []
+        self.commits = 0
+        self.history_items = history_items or []
+        self.statement = None
+
+    def add(self, record: DownloadRecord) -> None:
+        self.records.append(record)
 
     async def commit(self) -> None:
         self.commits += 1
 
-    async def refresh(self, job: DownloadJob) -> None:
-        self.jobs[job.id] = job
-
     async def rollback(self) -> None:
-        return None
+        self.records.clear()
 
-    async def get(
-        self,
-        model: type[DownloadJob],
-        job_id: uuid.UUID,
-        *,
-        populate_existing: bool = False,
-    ) -> DownloadJob | None:
-        self.get_calls.append((model, populate_existing))
-        return self.jobs.get(job_id)
+    async def execute(self, statement):
+        self.statement = statement
+        return QueryResult(self.history_items)
 
 
 def make_user() -> User:
@@ -72,6 +80,16 @@ def make_request(url: str) -> downloads.DownloadRequest:
 
 
 class DownloadDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_database_schema_has_filename_history_not_jobs(self):
+        self.assertEqual(
+            set(Base.metadata.tables),
+            {"users", "download_history"},
+        )
+        self.assertEqual(
+            set(Base.metadata.tables["download_history"].columns.keys()),
+            {"id", "user_id", "filename", "downloaded_at"},
+        )
+
     async def asyncSetUp(self) -> None:
         self.temp_directory = tempfile.TemporaryDirectory()
         self.download_root = Path(self.temp_directory.name)
@@ -112,7 +130,7 @@ class DownloadDeliveryTests(unittest.IsolatedAsyncioTestCase):
         scope = {
             "type": "http",
             "http_version": "1.1",
-            "method": "GET",
+            "method": "POST",
             "scheme": "http",
             "path": "/downloads/",
             "raw_path": b"/downloads/",
@@ -126,7 +144,7 @@ class DownloadDeliveryTests(unittest.IsolatedAsyncioTestCase):
         await response(scope, receive, send)
         return bytes(body)
 
-    async def test_post_returns_media_attachment_and_cleans_after_delivery(self):
+    async def test_post_returns_attachment_and_records_user_filename(self):
         contents = b"downloaded mp4 bytes"
         media_path = self.make_media_file(contents)
         db = FakeSession()
@@ -157,15 +175,14 @@ class DownloadDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "Sample%20video.mp4",
             response.headers["content-disposition"],
         )
-        self.assertEqual(
-            response.headers["x-download-job-id"],
-            str(next(iter(db.jobs))),
-        )
-        self.assertEqual(next(iter(db.jobs.values())).status, "completed")
+        self.assertNotIn("x-download-job-id", response.headers)
+        self.assertEqual(len(db.records), 1)
+        self.assertEqual(db.records[0].user_id, user.id)
+        self.assertEqual(db.records[0].filename, "Sample video.mp4")
         self.assertEqual(await self.consume(response), contents)
         self.assertFalse(media_path.exists())
 
-    async def test_failed_download_is_recorded(self):
+    async def test_failed_download_is_not_added_to_history(self):
         db = FakeSession()
 
         with patch.object(
@@ -183,9 +200,73 @@ class DownloadDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertEqual(raised.exception.status_code, 400)
-        job = next(iter(db.jobs.values()))
-        self.assertEqual(job.status, "failed")
-        self.assertEqual(job.error_message, "source unavailable")
+        self.assertEqual(db.records, [])
+        self.assertEqual(db.commits, 0)
+
+    async def test_history_returns_only_names_and_timestamps(self):
+        user = make_user()
+        timestamp = datetime.now(timezone.utc)
+        record = DownloadRecord(
+            user_id=user.id,
+            filename="Previously downloaded.mp4",
+            downloaded_at=timestamp,
+        )
+        db = FakeSession([record])
+
+        history = await downloads.list_download_history(
+            user,
+            cast(AsyncSession, db),
+        )
+
+        self.assertEqual(
+            history,
+            [
+                downloads.DownloadHistoryItem(
+                    filename="Previously downloaded.mp4",
+                    downloaded_at=timestamp,
+                )
+            ],
+        )
+        self.assertIn("download_history.user_id", str(db.statement))
+        self.assertNotIn("id", history[0].model_dump())
+
+    async def test_legacy_file_retrieval_route_is_not_registered(self):
+        from main import app
+
+        paths = app.openapi()["paths"]
+        self.assertIn("/downloads/history", paths)
+        self.assertFalse(any(path.endswith("/file") for path in paths))
+
+    async def test_database_failure_removes_file_and_does_not_return_it(self):
+        from sqlalchemy.exc import SQLAlchemyError
+
+        class FailingSession(FakeSession):
+            async def commit(self) -> None:
+                raise SQLAlchemyError("database unavailable")
+
+        media_path = self.make_media_file()
+        db = FailingSession()
+
+        with self.assertLogs("app.routers.downloads", level="ERROR"):
+            with patch.object(
+                downloads,
+                "download_media",
+                new=AsyncMock(
+                    return_value={
+                        "filename": "Sample.mp4",
+                        "filepath": str(media_path),
+                    }
+                ),
+            ):
+                with self.assertRaises(HTTPException) as raised:
+                    await downloads.create_download(
+                        make_request("https://example.com/video"),
+                        make_user(),
+                        cast(AsyncSession, db),
+                    )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertFalse(media_path.exists())
 
     async def test_failed_processing_removes_partial_files(self):
         class FailingDownloader:
@@ -219,101 +300,6 @@ class DownloadDeliveryTests(unittest.IsolatedAsyncioTestCase):
             list(self.media_root.glob(".clipfetch-working-*")),
             [],
         )
-
-    async def test_job_ownership_is_enforced(self):
-        owner = make_user()
-        other_user = make_user()
-        job = DownloadJob(
-            id=uuid.uuid4(),
-            user_id=owner.id,
-            video_url="https://x.com/example",
-            status="completed",
-        )
-        db = FakeSession()
-        db.jobs[job.id] = job
-
-        with self.assertRaises(HTTPException) as raised:
-            await downloads.retrieve_download(
-                job.id,
-                other_user,
-                cast(AsyncSession, db),
-            )
-
-        self.assertEqual(raised.exception.status_code, 404)
-
-    async def test_job_owner_can_retrieve_attachment(self):
-        contents = b"retrievable media"
-        media_path = self.make_media_file(contents)
-        owner = make_user()
-        job = DownloadJob(
-            id=uuid.uuid4(),
-            user_id=owner.id,
-            video_url="https://x.com/example",
-            status="completed",
-            filename="Owned video.mp4",
-            file_path=str(media_path),
-        )
-        db = FakeSession()
-        db.jobs[job.id] = job
-
-        response = await downloads.retrieve_download(
-            job.id,
-            owner,
-            cast(AsyncSession, db),
-        )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(await self.consume(response), contents)
-        self.assertFalse(media_path.exists())
-
-    async def test_client_disconnect_retains_file_until_expiry(self):
-        media_path = self.make_media_file()
-        user = make_user()
-        job = DownloadJob(
-            id=uuid.uuid4(),
-            user_id=user.id,
-            video_url="https://x.com/example",
-            status="completed",
-            filename="Interrupted video.mp4",
-            file_path=str(media_path),
-        )
-        db = FakeSession()
-        db.jobs[job.id] = job
-        response = await downloads.retrieve_download(
-            job.id,
-            user,
-            cast(AsyncSession, db),
-        )
-
-        async def receive():
-            return {"type": "http.request", "body": b"", "more_body": False}
-
-        async def disconnecting_send(message):
-            if message["type"] == "http.response.body":
-                raise OSError("simulated client disconnect")
-
-        scope = {
-            "type": "http",
-            "http_version": "1.1",
-            "method": "GET",
-            "scheme": "http",
-            "path": "/downloads/",
-            "raw_path": b"/downloads/",
-            "query_string": b"",
-            "headers": [],
-            "server": ("testserver", 80),
-            "client": ("testclient", 1234),
-            "root_path": "",
-            "asgi": {"version": "3.0", "spec_version": "2.4"},
-        }
-        with self.assertRaises(OSError):
-            await response(scope, receive, disconnecting_send)
-
-        self.assertTrue(media_path.exists())
-        old_time = time.time() - storage.RETENTION_SECONDS - 1
-        os.utime(media_path, (old_time, old_time))
-        self.assertEqual(storage.cleanup_expired_files(), 1)
-        self.assertFalse(media_path.exists())
 
     async def test_media_expires_after_thirty_minutes(self):
         media_path = self.make_media_file()
@@ -350,8 +336,7 @@ class DownloadDeliveryTests(unittest.IsolatedAsyncioTestCase):
         if lease is None:
             self.fail("Could not acquire the test transfer lock.")
         with lease:
-            removed = storage.cleanup_expired_files()
-            self.assertEqual(removed, 0)
+            self.assertEqual(storage.cleanup_expired_files(), 0)
             self.assertTrue(media_path.exists())
 
         self.assertEqual(storage.cleanup_expired_files(), 1)

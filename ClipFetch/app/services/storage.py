@@ -5,7 +5,7 @@ import re
 import shutil
 import time
 from pathlib import Path
-from typing import BinaryIO, Iterable
+from typing import BinaryIO
 
 
 logger = logging.getLogger(__name__)
@@ -24,21 +24,6 @@ _MEDIA_FILENAME = re.compile(
 _WORKING_DIRECTORY = re.compile(
     rf"^{re.escape(WORKING_DIRECTORY_PREFIX)}[0-9a-f]{{32}}$"
 )
-_LEGACY_EXTENSIONS = {
-    ".mp3",
-    ".mp4",
-    ".mkv",
-    ".webm",
-    ".mov",
-    ".m4v",
-    ".avi",
-    ".ts",
-    ".ogv",
-    ".flv",
-    ".3gp",
-}
-
-
 class StorageLease:
     """Hold a process-safe lock while media is being written or served."""
 
@@ -136,15 +121,6 @@ def resolve_download_path(raw_path: str | Path) -> Path | None:
     ):
         return resolved
 
-    # Continue serving files created by earlier ClipFetch versions. They are
-    # only eligible when a completed database job explicitly references them.
-    download_root = DOWNLOAD_DIR.resolve()
-    if (
-        resolved.parent == download_root
-        and resolved.suffix.lower() in _LEGACY_EXTENSIONS
-    ):
-        return resolved
-
     return None
 
 
@@ -180,7 +156,6 @@ def delete_media_file(path: Path) -> None:
 
 
 def cleanup_expired_files(
-    legacy_paths: Iterable[str | Path] = (),
     *,
     now: float | None = None,
 ) -> int:
@@ -224,22 +199,5 @@ def cleanup_expired_files(
                 continue
             except OSError:
                 logger.exception("Could not remove an expired media entry.")
-
-        for raw_path in legacy_paths:
-            managed_path = resolve_download_path(raw_path)
-            if (
-                managed_path is None
-                or managed_path.parent != DOWNLOAD_DIR.resolve()
-            ):
-                continue
-
-            try:
-                if managed_path.stat().st_mtime <= cutoff:
-                    managed_path.unlink()
-                    removed += 1
-            except FileNotFoundError:
-                continue
-            except OSError:
-                logger.exception("Could not remove an expired legacy media file.")
 
     return removed

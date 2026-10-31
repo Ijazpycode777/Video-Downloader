@@ -1,17 +1,19 @@
 import asyncio
 import logging
+from datetime import datetime
 from pathlib import Path
-from typing import Literal
-from uuid import UUID
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl, model_validator
+from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.types import Message, Receive, Scope, Send
 
 from app.engine import get_db
-from app.models import DownloadJob, User
+from app.models import DownloadRecord, User
 from app.security import get_current_user
 from app.services.storage import (
     StorageLease,
@@ -66,6 +68,11 @@ class DownloadRequest(BaseModel):
         return self
 
 
+class DownloadHistoryItem(BaseModel):
+    filename: str
+    downloaded_at: datetime
+
+
 class LeasedFileResponse(FileResponse):
     def __init__(self, *args, lease: StorageLease, **kwargs) -> None:
         self._storage_lease = lease
@@ -110,16 +117,11 @@ class LeasedFileResponse(FileResponse):
 
 
 def _file_response(
-    job: DownloadJob,
+    raw_path: Path,
+    filename: str,
     *,
     status_code: int = status.HTTP_200_OK,
-) -> FileResponse:
-    if not job.file_path:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="This download file has expired or was already delivered.",
-        )
-
+) -> LeasedFileResponse:
     try:
         lease = acquire_storage_lease(shared=True, blocking=False)
     except OSError as exc:
@@ -135,74 +137,57 @@ def _file_response(
             detail="Media storage is busy. Please retry the request.",
         )
 
-    file_path = resolve_download_path(job.file_path)
-    if file_path is None:
-        lease.release()
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="This download file has expired or was already delivered.",
-        )
-
+    lease_transferred = False
     try:
-        if is_expired(file_path):
-            lease.release()
+        file_path = resolve_download_path(raw_path)
+        if file_path is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="This download file has expired or was already delivered.",
             )
-    except OSError as exc:
-        lease.release()
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Download file not found.",
-        ) from exc
-
-    filename = Path(job.filename or file_path.name).name
-    media_type = {
-        ".mp3": "audio/mpeg",
-        ".mp4": "video/mp4",
-        ".mkv": "video/x-matroska",
-        ".webm": "video/webm",
-        ".mov": "video/quicktime",
-        ".m4v": "video/x-m4v",
-        ".avi": "video/x-msvideo",
-        ".ts": "video/mp2t",
-        ".ogv": "video/ogg",
-        ".flv": "video/x-flv",
-        ".3gp": "video/3gpp",
-    }.get(file_path.suffix.lower())
-
-    return LeasedFileResponse(
-        path=file_path,
-        filename=filename,
-        media_type=media_type or "application/octet-stream",
-        status_code=status_code,
-        content_disposition_type="attachment",
-        headers={"X-Download-Job-ID": str(job.id)},
-        lease=lease,
-    )
-
-
-async def _record_failed_job(
-    db: AsyncSession,
-    job_id: UUID,
-    error_message: str,
-) -> None:
-    try:
-        await db.rollback()
-        failed_job = await db.get(
-            DownloadJob, job_id, populate_existing=True
-        )
-        if failed_job is not None:
-            failed_job.status = "failed"
-            failed_job.error_message = error_message
-            await db.commit()
-    except Exception:
-        logger.exception("Could not record failed download job %s.", job_id)
         try:
-            await db.rollback()
-        except Exception:
-            logger.exception("Could not roll back failed download job update.")
+            if is_expired(file_path):
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=(
+                        "This download file has expired or was already "
+                        "delivered."
+                    ),
+                )
+        except OSError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Download file not found.",
+            ) from exc
+
+        filename = Path(filename).name
+        media_type = {
+            ".mp3": "audio/mpeg",
+            ".mp4": "video/mp4",
+            ".mkv": "video/x-matroska",
+            ".webm": "video/webm",
+            ".mov": "video/quicktime",
+            ".m4v": "video/x-m4v",
+            ".avi": "video/x-msvideo",
+            ".ts": "video/mp2t",
+            ".ogv": "video/ogg",
+            ".flv": "video/x-flv",
+            ".3gp": "video/3gpp",
+        }.get(file_path.suffix.lower())
+
+        response = LeasedFileResponse(
+            path=file_path,
+            filename=filename,
+            media_type=media_type or "application/octet-stream",
+            status_code=status_code,
+            content_disposition_type="attachment",
+            lease=lease,
+        )
+        lease_transferred = True
+        return response
+    finally:
+        if not lease_transferred:
+            lease.release()
 
 
 @router.post(
@@ -211,19 +196,12 @@ async def _record_failed_job(
     response_class=FileResponse,
     responses={
         status.HTTP_201_CREATED: {
-            "description": (
-                "The completed media file as an attachment. "
-                "The job ID is returned in X-Download-Job-ID."
-            ),
+            "description": "The completed media file as an attachment.",
             "content": _MEDIA_RESPONSE_CONTENT,
             "headers": {
                 "Content-Disposition": {
                     "description": "Attachment filename for the media file.",
                     "schema": {"type": "string"},
-                },
-                "X-Download-Job-ID": {
-                    "description": "ID of the persisted download job.",
-                    "schema": {"type": "string", "format": "uuid"},
                 },
             },
         }
@@ -234,101 +212,103 @@ async def create_download(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> FileResponse:
-    job = DownloadJob(
-        user_id=current_user.id,
-        video_url=str(data.url),
-        status="pending",
-        media_type=data.media_type,
-        quality=data.quality,
-    )
-
-    db.add(job)
-    await db.commit()
-    await db.refresh(job)
-
-    job_id = job.id
-    job.status = "processing"
-    await db.commit()
-
-    result: dict[str, object] | None = None
-
     try:
         result = await download_media(
             url=str(data.url),
             media_type=data.media_type,
             quality=data.quality,
         )
-
-        job.status = "completed"
-        job.title = str(result["title"])
-        job.filename = str(result["filename"])
-        job.file_path = str(result["filepath"])
-        job.error_message = None
-
-        await db.commit()
-        await db.refresh(job)
     except VideoDownloadError as exc:
-        await _record_failed_job(db, job_id, str(exc))
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
         ) from exc
     except Exception as exc:
-        await _record_failed_job(
-            db,
-            job_id,
-            "An unexpected download error occurred.",
-        )
-        if result is not None:
-            await asyncio.to_thread(
-                delete_media_file,
-                Path(str(result["filepath"])),
-            )
+        logger.exception("Unexpected error while creating a download.")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="The download could not be completed.",
         ) from exc
 
-    return _file_response(
-        job,
-        status_code=status.HTTP_201_CREATED,
-    )
+    media_path = Path(str(result["filepath"]))
+    filename = Path(str(result["filename"])).name
+    if not filename or filename in {".", ".."}:
+        await asyncio.to_thread(delete_media_file, media_path)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="The downloader returned an invalid filename.",
+        )
+
+    try:
+        response = _file_response(
+            media_path,
+            filename,
+            status_code=status.HTTP_201_CREATED,
+        )
+    except Exception:
+        await asyncio.to_thread(delete_media_file, media_path)
+        raise
+
+    try:
+        db.add(
+            DownloadRecord(
+                user_id=current_user.id,
+                filename=filename,
+            )
+        )
+        await db.commit()
+    except SQLAlchemyError as exc:
+        logger.exception("Could not record the completed download.")
+        try:
+            await db.rollback()
+        except SQLAlchemyError:
+            logger.exception("Could not roll back download history.")
+        response._storage_lease.release()
+        await asyncio.to_thread(delete_media_file, media_path)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The download could not be recorded. Please retry.",
+        ) from exc
+    except Exception as exc:
+        logger.exception("Unexpected error while recording download history.")
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception("Could not roll back download history.")
+        response._storage_lease.release()
+        await asyncio.to_thread(delete_media_file, media_path)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="The download could not be recorded.",
+        ) from exc
+
+    return response
 
 
 @router.get(
-    "/{job_id}/file",
-    response_class=FileResponse,
-    responses={
-        status.HTTP_200_OK: {
-            "description": "The completed media file as an attachment.",
-            "content": _MEDIA_RESPONSE_CONTENT,
-        },
-        status.HTTP_404_NOT_FOUND: {
-            "description": "The job or its expired/delivered file was not found."
-        },
-        status.HTTP_409_CONFLICT: {
-            "description": "The job has not completed."
-        },
-    },
+    "/history",
+    response_model=list[DownloadHistoryItem],
 )
-async def retrieve_download(
-    job_id: UUID,
+async def list_download_history(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-) -> FileResponse:
-    job = await db.get(DownloadJob, job_id)
-
-    # Do not disclose whether another user's job exists.
-    if job is None or job.user_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Download not found.",
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> list[DownloadHistoryItem]:
+    result = await db.execute(
+        select(DownloadRecord)
+        .where(DownloadRecord.user_id == current_user.id)
+        .order_by(
+            DownloadRecord.downloaded_at.desc(),
+            DownloadRecord.id.desc(),
         )
-
-    if job.status != "completed":
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="This download is not available yet.",
+        .limit(limit)
+        .offset(offset)
+    )
+    return [
+        DownloadHistoryItem(
+            filename=record.filename,
+            downloaded_at=record.downloaded_at,
         )
-
-    return _file_response(job)
+        for record in result.scalars().all()
+    ]

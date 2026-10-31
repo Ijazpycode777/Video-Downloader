@@ -1,145 +1,85 @@
-ClipFetch
+# ClipFetch
 
-A private video and audio downloader built with FastAPI and PostgreSQL.
+ClipFetch is an authenticated video/audio downloader API built with FastAPI, PostgreSQL, SQLAlchemy, Alembic, and yt-dlp. This repository contains the API and its deployment configuration; it does not contain a separate browser frontend.
 
-ClipFetch is a backend API that allows registered users to request video downloads or extract audio as MP3. It uses "yt-dlp" to retrieve media and FFmpeg to process it.
+## Features
 
-«Version: 0.0.1 — Early development»
+- Invite-only registration, password login, and OAuth2 bearer authentication.
+- Signed JWT access tokens using **HS256** with a fixed **30-minute** lifetime.
+- Video downloads (360p, 480p, 720p, 1080p, or best) and MP3 extraction.
+- Authenticated `POST /downloads/` returns the media as a normal attachment.
+- Per-user download history stores the delivered filename and timestamp, not a job or file identifier.
+- Temporary media is deleted after a successful response or expires after 30 minutes.
+- PostgreSQL schema managed by Alembic; the migration preserves prior completed filenames.
+- Docker Compose deployment with PostgreSQL, persistent database storage, and health checks.
 
-Features
+## Run locally
 
-- User authentication: Password hashing and JWT-based authentication.
-- Video downloads: Select video quality, including 360p, 480p, 720p, 1080p, or best available.
-- MP3 extraction: Extract audio with configurable quality options.
-- PostgreSQL database: Persist users and download-job records.
-- Database migrations: Manage schema changes using Alembic.
-- Download tracking: Store job status, media metadata, and error information.
-- Direct media delivery: Return completed downloads as authenticated file attachments.
-- Temporary storage: Remove delivered media immediately and expire undelivered media after 30 minutes.
-- Asynchronous API: Built with FastAPI and SQLAlchemy's asynchronous database support.
+Requirements: Python 3.14+, [uv](https://docs.astral.sh/uv/), and PostgreSQL. yt-dlp uses the FFmpeg binary provided by `imageio-ffmpeg`.
 
-Tech Stack
+1. Create a local environment file and set strong secrets:
 
-Technology| Purpose
-Python| Application language
-FastAPI| REST API framework
-PostgreSQL| Persistent database
-SQLAlchemy| ORM and asynchronous database access
-Alembic| Database migrations
-Pydantic Settings| Configuration management
-Argon2| Password hashing
-PyJWT| JWT authentication
-yt-dlp| Media downloading
-FFmpeg| Media processing and audio extraction
-uv| Python dependency and environment management
+   ```powershell
+   Copy-Item .env.example .env
+   ```
 
-Project Structure
+   Set `DATABASE_URL` to a PostgreSQL async URL, `JWT_SECRET_KEY` to a unique random value of at least 32 bytes, and `INVITE_CODE` to a private registration code. Do not use the example secrets in a real deployment.
 
-ClipFetch/
-├── main.py
-├── pyproject.toml
-├── uv.lock
-├── alembic.ini
-├── migrations/
-│   ├── env.py
-│   └── versions/
-└── app/
-    ├── config.py
-    ├── engine.py
-    ├── models.py
-    ├── security.py
-    ├── routers/
-    │   ├── auth.py
-    │   └── downloads.py
-    └── services/
-        ├── storage.py
-        └── video.py
+2. Install and migrate:
 
-Requirements
+   ```powershell
+   uv sync
+   uv run python -m alembic upgrade head
+   ```
 
-- Python version specified by ".python-version"
-- PostgreSQL
-- FFmpeg
-- Git
-- uv
+3. Start the API:
 
-Getting Started
+   ```powershell
+   uv run uvicorn main:app --host 0.0.0.0 --port 8000
+   ```
 
-1. Clone the repository
+OpenAPI documentation is available at `http://localhost:8000/docs`; `GET /health` checks database connectivity.
 
-git clone https://github.com/YOUR_USERNAME/ClipFetch.git
-cd ClipFetch
+## Deploy with Docker Compose
 
-Replace "YOUR_USERNAME" with your GitHub username.
+Copy `.env.example` to `.env`, replace all example credentials, and start the services:
 
-2. Install dependencies
+```powershell
+Copy-Item .env.example .env
+docker compose up --build -d
+```
 
-uv sync
+The API container applies Alembic migrations before starting Uvicorn. PostgreSQL data and the temporary media directory use separate Docker volumes. For Compose, choose a database password that is URL-safe because it is embedded in the async database URL. Back up the database volume using your normal PostgreSQL backup process.
 
-3. Configure environment variables
+For a managed container platform, build the `ClipFetch` directory using the included `Dockerfile` and provide `DATABASE_URL`, `JWT_SECRET_KEY`, `INVITE_CODE`, and a writable `CLIPFETCH_DOWNLOAD_DIR`. The database must be PostgreSQL and accessible before container startup. Set the platform's `PORT` as usual. Local media storage is ephemeral unless the platform mounts a persistent volume; downloads are still returned directly to the requesting user.
 
-Create a ".env" file in the project root.
+## Configuration
 
-Configure the following variables with your own values:
+| Variable | Required | Description |
+|---|---:|---|
+| `DATABASE_URL` | Yes | PostgreSQL URL; `postgres://` and `postgresql://` are normalized to `postgresql+asyncpg://`. |
+| `JWT_SECRET_KEY` | Yes | Unique signing secret, at least 32 UTF-8 bytes. |
+| `INVITE_CODE` | Yes | Shared code required to register an account. |
+| `JWT_ALGORITHM` | No | Fixed to `HS256`; other values are rejected. |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | No | Fixed to 30 minutes; other values are rejected. |
+| `CLIPFETCH_DOWNLOAD_DIR` | No | Writable temporary media directory; defaults to `downloads`. |
 
-DATABASE_URL=postgresql+asyncpg://USER:PASSWORD@HOST:5432/DATABASE
-JWT_SECRET_KEY=YOUR_STRONG_RANDOM_SECRET
-JWT_ALGORITHM=HS256
-ACCESS_TOKEN_EXPIRE_MINUTES=30
-INVITE_CODE=YOUR_PRIVATE_INVITE_CODE
+## API flow
 
-Use the actual variable names and formats expected by the application configuration. Never commit ".env" or expose real credentials in public repositories.
+1. `POST /auth/register` creates an account using the invite code.
+2. Authenticate at `POST /auth/token` using OAuth2 form fields (`username` accepts an email address or username) or `POST /auth/login` using JSON credentials. Both issue the same HS256 bearer JWT.
+3. Send `Authorization: Bearer <token>` to `POST /downloads/`. The endpoint completes yt-dlp/FFmpeg processing and responds with the file attachment; no job ID or follow-up file URL is returned.
+4. `GET /downloads/history` returns the authenticated user's filenames and download timestamps. It supports `limit` (1–100) and `offset` pagination.
+5. `GET /auth/me` returns the authenticated profile.
 
-4. Apply database migrations
+The download history is metadata only. The media file is temporary, is deleted after a complete response, and otherwise expires after 30 minutes. Since the API responds directly with the file, the caller must keep the original POST response to save it; a history entry is not a file retrieval link.
 
-Ensure PostgreSQL is running and the configured database exists.
+## Security and operations
 
-uv run python -m alembic upgrade head
+- Use HTTPS and unique production credentials. Keep `.env` out of source control.
+- Each history query is scoped to the authenticated user. Passwords are stored as Argon2 hashes.
+- URL validation blocks common local/private-address cases but is not a complete SSRF defense. Restrict outbound network access at the deployment boundary.
+- Set platform-level request timeouts, memory/disk limits, and rate/concurrency limits appropriate for the workload.
+- The temporary media directory is local to each container. This is compatible with direct POST delivery, but does not make media durable or shared across replicas.
 
-5. Start the API
-
-uv run uvicorn main:app --reload
-
-The development server should be available at:
-
-- API root: "http://127.0.0.1:8000/"
-- Health check: "http://127.0.0.1:8000/health"
-- Interactive API documentation: "http://127.0.0.1:8000/docs"
-
-API Overview
-
-Endpoint| Purpose
-"GET /"| API welcome message
-"GET /health"| Health check
-Authentication routes| User registration and login
-"POST /downloads/"| Download and return a media attachment
-"GET /downloads/{job_id}/file"| Retrieve a completed attachment, subject to authorization
-
-Consult the interactive Swagger documentation at "/docs" for the exact request schemas and authentication requirements.
-For Swagger's OAuth2 login, enter either your account email or username in the "username" field, along with your password.
-
-Temporary media and Render deployment
-
-- `POST /downloads/` returns the media bytes with `Content-Disposition: attachment`; `X-Download-Job-ID` identifies the persisted job. The endpoint still waits for yt-dlp and FFmpeg to finish before responding.
-- The authenticated `GET /downloads/{job_id}/file` endpoint remains available. A media file is removed after delivery, or expires 30 minutes after processing completes if it is never delivered. A job's status and metadata remain in PostgreSQL; its file may no longer be available, in which case file retrieval returns 404.
-- Media and partial downloads are kept under `.clipfetch-media` inside `CLIPFETCH_DOWNLOAD_DIR` (default: `downloads`). Startup and 30-second periodic cleanup remove only files created by ClipFetch once they reach the 30-minute expiry. Active downloads and transfers hold a filesystem lock so cleanup cannot remove files in use. Abandoned work directories are eligible for cleanup after 30 minutes.
-- No Render setting or persistent disk is required for this direct-response flow. The Render filesystem is ephemeral, so media is not expected to survive restarts. `CLIPFETCH_DOWNLOAD_DIR` remains optional and, if set, must point to a writable directory.
-- Workers sharing a filesystem coordinate cleanup with OS file locks. Separate Render instances have separate ephemeral filesystems; direct POST delivery stays on the instance handling that request, but a delayed GET handled by a different instance cannot access another instance's local file. Use one instance or shared storage that supports file locking if cross-instance retrieval is required.
-
-Security Notes
-
-- Store credentials and signing keys in environment variables.
-- Use strong, unique JWT signing secrets.
-- Keep password hashes instead of plaintext passwords.
-- Restrict download-job and file access to the owning user.
-- URL checks reject common local and private-address cases but are not complete SSRF protection. Restrict server-side network access separately.
-- Apply download-size limits, concurrency controls, and storage quotas before accepting unrestricted public traffic.
-- Use HTTPS in production.
-
-Current Status
-
-ClipFetch v0.0.1 is an early-stage backend project. Local development and deployment readiness are separate milestones; production operation requires appropriate security controls, download limits, and monitoring.
-
-License
-
-No license has been specified yet. All rights are reserved unless a license is added to this repository.
+No license has been specified.

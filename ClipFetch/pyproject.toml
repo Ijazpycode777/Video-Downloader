@@ -1,7 +1,7 @@
 [project]
 name = "clipfetch"
-version = "0.0.1"
-description = "Add your description here"
+version = "0.1.0"
+description = "Authenticated video and audio downloader API"
 readme = "README.md"
 authors = [
     { name = "Ijaz", email = "ijazi3485@gmail.com" }
@@ -25,9 +25,6 @@ dependencies = [
     "yt-dlp[default]>=2026.10.26",
 ]
 
-
-[project.scripts]
-clipfetch = "clipfetch:main"
 
 [build-system]
 requires = ["uv_build>=0.13.6,<0.14.0"]

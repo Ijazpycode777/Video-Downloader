@@ -1,15 +1,15 @@
 from pathlib import Path
-import warnings
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
 
 
 # ClipFetch/
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ENV_FILE = PROJECT_ROOT / ".env"
 
-SUPPORTED_JWT_ALGORITHMS = ("HS256", "HS384", "HS512")
 MIN_JWT_SECRET_BYTES = 32
 
 
@@ -20,27 +20,50 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    DATABASE_URL: str
-    JWT_SECRET_KEY: str
+    DATABASE_URL: str = Field(default="", repr=False)
+    JWT_SECRET_KEY: str = Field(default="", repr=False)
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
-    INVITE_CODE: str
+    INVITE_CODE: str = Field(default="", repr=False)
+
+    @field_validator("DATABASE_URL")
+    @classmethod
+    def validate_database_url(cls, value: str) -> str:
+        url = value.strip()
+        if not url:
+            raise ValueError("DATABASE_URL must not be empty.")
+
+        if url.startswith("postgres://"):
+            url = "postgresql+asyncpg://" + url.removeprefix("postgres://")
+        elif url.startswith("postgresql://"):
+            url = "postgresql+asyncpg://" + url.removeprefix(
+                "postgresql://"
+            )
+
+        try:
+            parsed_url = make_url(url)
+        except ArgumentError as exc:
+            raise ValueError(
+                "DATABASE_URL must be a valid PostgreSQL URL."
+            ) from exc
+
+        if parsed_url.drivername != "postgresql+asyncpg":
+            raise ValueError(
+                "DATABASE_URL must use the postgresql+asyncpg driver."
+            )
+        if not parsed_url.database:
+            raise ValueError("DATABASE_URL must include a database name.")
+
+        return url
 
     @field_validator("JWT_SECRET_KEY")
     @classmethod
     def validate_jwt_secret(cls, value: str) -> str:
         secret = value.strip()
 
-        if not secret:
-            raise ValueError("JWT_SECRET_KEY must not be empty.")
-
         if len(secret.encode("utf-8")) < MIN_JWT_SECRET_BYTES:
-            warnings.warn(
-                "JWT_SECRET_KEY is shorter than 32 bytes. "
-                "Use a cryptographically random secret of at least "
-                "32 bytes.",
-                UserWarning,
-                stacklevel=2,
+            raise ValueError(
+                "JWT_SECRET_KEY must contain at least 32 UTF-8 bytes."
             )
 
         return secret
@@ -48,24 +71,17 @@ class Settings(BaseSettings):
     @field_validator("JWT_ALGORITHM")
     @classmethod
     def validate_jwt_algorithm(cls, value: str) -> str:
-        algorithm = value.strip().upper()
-
-        if algorithm not in SUPPORTED_JWT_ALGORITHMS:
-            raise ValueError(
-                "JWT_ALGORITHM must be one of: "
-                + ", ".join(SUPPORTED_JWT_ALGORITHMS)
-            )
-
-        return algorithm
+        if value.strip() != "HS256":
+            raise ValueError("JWT_ALGORITHM is fixed to HS256.")
+        return "HS256"
 
     @field_validator("ACCESS_TOKEN_EXPIRE_MINUTES")
     @classmethod
     def validate_token_expiry(cls, value: int) -> int:
-        if value < 1:
+        if value != 30:
             raise ValueError(
-                "ACCESS_TOKEN_EXPIRE_MINUTES must be at least 1."
+                "ACCESS_TOKEN_EXPIRE_MINUTES is fixed to 30 minutes."
             )
-
         return value
 
     @field_validator("INVITE_CODE")
