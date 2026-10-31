@@ -118,7 +118,11 @@ def _youtube_provider_for_url(url: str) -> str | None:
     if hostname is None:
         return None
     hostname = hostname.lower().rstrip(".")
-    if hostname == "youtube.com" or hostname.endswith(".youtube.com"):
+    if (
+        hostname == "youtu.be"
+        or hostname == "youtube.com"
+        or hostname.endswith(".youtube.com")
+    ):
         return "youtube"
     return None
 

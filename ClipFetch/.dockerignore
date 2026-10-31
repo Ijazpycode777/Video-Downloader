@@ -9,3 +9,6 @@ downloads
 tests
 .pytest_cache
 .ruff_cache
+cookies.txt
+*.cookies
+secrets/

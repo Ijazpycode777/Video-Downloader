@@ -5,6 +5,7 @@ import os
 import time
 import unittest
 import uuid
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
 os.environ.setdefault(
@@ -37,6 +38,7 @@ from app.services.cookies import (
     decrypt_cookies,
     encrypt_cookies,
     is_expired,
+    next_auth_expiration,
     parse_netscape_cookies,
     serialize_netscape_cookies,
 )
@@ -151,8 +153,6 @@ class CookieStorageTests(unittest.TestCase):
     def test_session_cookie_remains_session_cookie_without_fabricated_expiry(
         self,
     ):
-        from app.services.cookies import next_auth_expiration
-
         imported = parse_netscape_cookies(
             b".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tsession-token\n"
         )
@@ -161,6 +161,22 @@ class CookieStorageTests(unittest.TestCase):
         self.assertEqual(restored[0].expires, 0)
         self.assertFalse(is_expired(restored))
         self.assertIsNone(next_auth_expiration(restored))
+
+    def test_next_auth_expiration_ignores_expired_auth_cookies(self):
+        now = int(time.time())
+        cookies = [
+            youtube_cookie("expired", expires=now - 20),
+            youtube_cookie("later", expires=now + 300, name="APISID"),
+            youtube_cookie("earliest", expires=now + 100, name="SAPISID"),
+            youtube_cookie("irrelevant", expires=now + 50, name="PREF"),
+        ]
+
+        expiration = next_auth_expiration(cookies, now=now)
+
+        self.assertEqual(
+            expiration,
+            datetime.fromtimestamp(now + 100, timezone.utc),
+        )
 
     def test_cookie_import_rejects_non_youtube_domains(self):
         with self.assertRaises(CookieConfigurationError):
@@ -214,7 +230,7 @@ class PerUserCookieAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(download_calls), 2)
         self.assertNotIn("cookie_data", download_calls[0])
         self.assertIn(b"only-this-user", download_calls[1]["cookie_data"])
-        self.assertEqual(db.commits, 1)
+        self.assertEqual(db.commits, 0)
 
     async def test_cookie_import_encrypts_before_persisting(self):
         owner = user()
@@ -298,6 +314,32 @@ class PerUserCookieAuthTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(other_response.status, "not_configured")
 
+    async def test_cookie_status_reports_next_future_auth_expiration(self):
+        owner = user()
+        now = int(time.time())
+        stored = credential(
+            owner,
+            [
+                youtube_cookie("expired", expires=now - 30),
+                youtube_cookie("future-later", expires=now + 300, name="APISID"),
+                youtube_cookie(
+                    "future-earliest",
+                    expires=now + 120,
+                    name="SAPISID",
+                ),
+            ],
+        )
+        response = await provider_cookie_status(
+            "youtube",
+            owner,
+            CookieSession({owner.id: stored}),  # type: ignore[arg-type]
+        )
+
+        self.assertEqual(
+            response.expires_at,
+            datetime.fromtimestamp(now + 120, timezone.utc),
+        )
+
     async def test_authentication_challenge_retries_once_with_user_cookies(
         self,
     ):
@@ -330,6 +372,43 @@ class PerUserCookieAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"SID\tuser-one-secret", calls[0]["cookie_data"])
         self.assertNotIn(b"expired-secret", calls[0]["cookie_data"])
         self.assertEqual(calls[0]["url"], str(request.url))
+
+    async def test_youtu_be_challenge_retries_with_user_cookies(self):
+        owner = user()
+        stored = credential(owner, [youtube_cookie("short-url-user-cookie")])
+        db = CookieSession({owner.id: stored})
+        request = downloads.DownloadRequest.model_validate(
+            {"url": "https://youtu.be/example"}
+        )
+        calls = []
+
+        async def downloader(**kwargs):
+            calls.append(kwargs)
+            if kwargs.get("cookie_data") is None:
+                _raise_source_error(
+                    DownloadError("Sign in to confirm you're not a bot"),
+                    url=kwargs["url"],
+                    has_cookies=False,
+                )
+            return {"filename": "short-url.mp4", "filepath": "unused"}
+
+        with (
+            patch.object(downloads, "download_media", side_effect=downloader),
+            patch.object(downloads, "_file_response", return_value=object()),
+        ):
+            response = await downloads.create_download(
+                request,
+                owner,
+                db,  # type: ignore[arg-type]
+            )
+
+        self.assertIsNotNone(response)
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("cookie_data", calls[0])
+        self.assertIn(
+            b"short-url-user-cookie",
+            calls[1]["cookie_data"],
+        )
 
     async def test_expired_cookies_are_never_passed_to_downloader(self):
         owner = user()

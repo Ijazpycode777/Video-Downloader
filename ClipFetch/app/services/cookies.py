@@ -236,12 +236,15 @@ def current_cookies(
 
 def next_auth_expiration(
     cookies: list[Cookie],
+    *,
+    now: int | None = None,
 ) -> datetime | None:
+    current_time = int(time.time()) if now is None else now
     expirations = [
         cookie.expires
         for cookie in cookies
         if cookie.is_auth_cookie
-        if not cookie.is_session_cookie
+        if not cookie.is_session_cookie and cookie.expires > current_time
     ]
     return (
         datetime.fromtimestamp(min(expirations), timezone.utc)
@@ -271,4 +274,3 @@ def serialize_netscape_cookies(cookies: list[Cookie]) -> bytes:
 
 def is_expired(cookies: list[Cookie], *, now: int | None = None) -> bool:
     return not active_auth_cookies(cookies, now=now)
-

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Literal
@@ -8,12 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl, model_validator
 from sqlalchemy import select
-from sqlalchemy.exc import (
-    DataError,
-    IntegrityError,
-    OperationalError,
-    SQLAlchemyError,
-)
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.types import Message, Receive, Scope, Send
 
@@ -93,8 +89,15 @@ class DownloadHistoryItem(BaseModel):
 
 
 class LeasedFileResponse(FileResponse):
-    def __init__(self, *args, lease: StorageLease, **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        lease: StorageLease,
+        on_body_complete: Callable[[], Awaitable[None]] | None = None,
+        **kwargs,
+    ) -> None:
         self._storage_lease = lease
+        self._on_body_complete = on_body_complete
         super().__init__(*args, **kwargs)
 
     async def __call__(
@@ -126,6 +129,8 @@ class LeasedFileResponse(FileResponse):
         try:
             await super().__call__(response_scope, receive, tracked_send)
             if successful_status and complete_body:
+                if self._on_body_complete is not None:
+                    await self._on_body_complete()
                 await asyncio.to_thread(
                     delete_delivered_file,
                     self._storage_lease,
@@ -140,6 +145,7 @@ def _file_response(
     filename: str,
     *,
     status_code: int = status.HTTP_200_OK,
+    on_body_complete: Callable[[], Awaitable[None]] | None = None,
 ) -> LeasedFileResponse:
     try:
         lease = acquire_storage_lease(shared=True, blocking=False)
@@ -201,6 +207,7 @@ def _file_response(
             status_code=status_code,
             content_disposition_type="attachment",
             lease=lease,
+            on_body_complete=on_body_complete,
         )
         lease_transferred = True
         return response
@@ -280,78 +287,42 @@ async def create_download(
             ),
         )
 
+    async def record_completed_response() -> None:
+        try:
+            db.add(
+                DownloadRecord(
+                    user_id=current_user.id,
+                    filename=filename,
+                )
+            )
+            await db.commit()
+        except SQLAlchemyError:
+            logger.exception(
+                "Could not record the completed response in download history."
+            )
+            try:
+                await db.rollback()
+            except SQLAlchemyError:
+                logger.exception("Could not roll back download history.")
+        except Exception:
+            logger.exception(
+                "Unexpected error recording completed response history."
+            )
+            try:
+                await db.rollback()
+            except Exception:
+                logger.exception("Could not roll back download history.")
+
     try:
         response = _file_response(
             media_path,
             filename,
             status_code=status.HTTP_201_CREATED,
+            on_body_complete=record_completed_response,
         )
     except Exception:
         await asyncio.to_thread(delete_media_file, media_path)
         raise
-
-    try:
-        db.add(
-            DownloadRecord(
-                user_id=current_user.id,
-                filename=filename,
-            )
-        )
-        await db.commit()
-    except SQLAlchemyError as exc:
-        logger.exception("Could not record the completed download.")
-        try:
-            await db.rollback()
-        except SQLAlchemyError:
-            logger.exception("Could not roll back download history.")
-        response._storage_lease.release()
-        await asyncio.to_thread(delete_media_file, media_path)
-        if isinstance(exc, IntegrityError):
-            error_detail = (
-                "The media was downloaded, but its filename conflicts with "
-                "an existing history record. The file was discarded."
-            )
-            error_status = status.HTTP_409_CONFLICT
-        elif isinstance(exc, DataError):
-            error_detail = (
-                "The media was downloaded, but its filename could not be "
-                "stored because it exceeds a database field limit or has "
-                "an invalid value. The file was discarded."
-            )
-            error_status = status.HTTP_422_UNPROCESSABLE_ENTITY
-        elif isinstance(exc, OperationalError):
-            error_detail = (
-                "The media was downloaded, but its filename could not be "
-                "saved because PostgreSQL is unavailable. The file was "
-                "discarded; please retry."
-            )
-            error_status = status.HTTP_503_SERVICE_UNAVAILABLE
-        else:
-            error_detail = (
-                "The media was downloaded, but PostgreSQL could not save "
-                "its filename to your history. The file was discarded."
-            )
-            error_status = status.HTTP_500_INTERNAL_SERVER_ERROR
-        raise HTTPException(
-            status_code=error_status,
-            detail=error_detail,
-        ) from exc
-    except Exception as exc:
-        logger.exception("Unexpected error while recording download history.")
-        try:
-            await db.rollback()
-        except Exception:
-            logger.exception("Could not roll back download history.")
-        response._storage_lease.release()
-        await asyncio.to_thread(delete_media_file, media_path)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                "The media was downloaded, but its filename could not be "
-                "saved to your history because of an unexpected server "
-                "error. The file was discarded."
-            ),
-        ) from exc
 
     return response
 

@@ -182,11 +182,65 @@ class DownloadDeliveryTests(unittest.IsolatedAsyncioTestCase):
             response.headers["content-disposition"],
         )
         self.assertNotIn("x-download-job-id", response.headers)
+        self.assertEqual(db.records, [])
+        self.assertEqual(db.commits, 0)
+        self.assertEqual(await self.consume(response), contents)
         self.assertEqual(len(db.records), 1)
         self.assertEqual(db.records[0].user_id, user.id)
         self.assertEqual(db.records[0].filename, "Sample video.mp4")
-        self.assertEqual(await self.consume(response), contents)
+        self.assertEqual(db.commits, 1)
         self.assertFalse(media_path.exists())
+
+    async def test_interrupted_response_is_not_added_to_history(self):
+        media_path = self.make_media_file(b"transfer that will be interrupted")
+        db = FakeSession()
+        user = make_user()
+        result = {
+            "filename": "Interrupted.mp4",
+            "filepath": str(media_path),
+        }
+
+        with patch.object(
+            downloads,
+            "download_media",
+            new=AsyncMock(return_value=result),
+        ):
+            response = await downloads.create_download(
+                make_request("https://www.facebook.com/example"),
+                user,
+                cast(AsyncSession, db),
+            )
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def disconnecting_send(message):
+            if (
+                message["type"] == "http.response.body"
+                and message.get("body")
+            ):
+                raise OSError("client disconnected during response")
+
+        scope = {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/downloads/",
+            "raw_path": b"/downloads/",
+            "query_string": b"",
+            "headers": [],
+            "server": ("testserver", 80),
+            "client": ("testclient", 1234),
+            "root_path": "",
+            "asgi": {"version": "3.0", "spec_version": "2.4"},
+        }
+        with self.assertRaises(OSError):
+            await response(scope, receive, disconnecting_send)
+
+        self.assertEqual(db.records, [])
+        self.assertEqual(db.commits, 0)
+        self.assertTrue(media_path.exists())
 
     async def test_failed_download_is_not_added_to_history(self):
         db = FakeSession()
@@ -269,7 +323,9 @@ class DownloadDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/downloads/history", paths)
         self.assertFalse(any(path.endswith("/file") for path in paths))
 
-    async def test_database_failure_removes_file_and_does_not_return_it(self):
+    async def test_history_failure_after_send_is_logged_without_false_history(
+        self,
+    ):
         from sqlalchemy.exc import SQLAlchemyError
 
         class FailingSession(FakeSession):
@@ -279,26 +335,27 @@ class DownloadDeliveryTests(unittest.IsolatedAsyncioTestCase):
         media_path = self.make_media_file()
         db = FailingSession()
 
-        with self.assertLogs("app.routers.downloads", level="ERROR"):
-            with patch.object(
-                downloads,
-                "download_media",
-                new=AsyncMock(
-                    return_value={
-                        "filename": "Sample.mp4",
-                        "filepath": str(media_path),
-                    }
-                ),
-            ):
-                with self.assertRaises(HTTPException) as raised:
-                    await downloads.create_download(
-                        make_request("https://example.com/video"),
-                        make_user(),
-                        cast(AsyncSession, db),
-                    )
+        with patch.object(
+            downloads,
+            "download_media",
+            new=AsyncMock(
+                return_value={
+                    "filename": "Sample.mp4",
+                    "filepath": str(media_path),
+                }
+            ),
+        ):
+            response = await downloads.create_download(
+                make_request("https://example.com/video"),
+                make_user(),
+                cast(AsyncSession, db),
+            )
 
-        self.assertEqual(raised.exception.status_code, 500)
-        self.assertIn("PostgreSQL could not save", raised.exception.detail)
+        with self.assertLogs("app.routers.downloads", level="ERROR"):
+            self.assertEqual(await self.consume(response), b"media")
+
+        self.assertEqual(db.records, [])
+        self.assertEqual(db.commits, 0)
         self.assertFalse(media_path.exists())
 
     async def test_yt_dlp_failures_return_safe_category_specific_messages(self):
